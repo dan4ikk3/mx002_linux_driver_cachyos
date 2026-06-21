@@ -82,6 +82,17 @@ impl DeviceDispatcher {
     const RELEASED: i32 = 0;
     const HOLD: i32 = 2;
 
+    // Оригинальный диапазон координат планшета: 0-4096
+    const RAW_MAX: i32 = 4096;
+    const RAW_CENTER: i32 = 2048;
+
+    // Виртуальное устройство: диапазон 0-8191 (стандартный для планшетов)
+    const VIRTUAL_MAX: i32 = 8191;
+    const VIRTUAL_CENTER: i32 = 4095;
+
+    // Масштабирование: 8x для высокой чувствительности
+    const SCALE: f32 = 8.0;
+
     pub fn new() -> Self {
         let default_tablet_button_id_to_key_code_map: HashMap<u8, Vec<Key>> = [
             (0, vec![Key::KEY_TAB]),
@@ -94,8 +105,6 @@ impl DeviceDispatcher {
             (7, vec![Key::KEY_LEFTCTRL, Key::KEY_KPMINUS]),
             (8, vec![Key::KEY_LEFTCTRL, Key::KEY_KPPLUS]),
             (9, vec![Key::KEY_E]),
-            //10 This code is not emitted by physical device
-            //11 This code is not emitted by physical device
             (12, vec![Key::KEY_B]),
             (13, vec![Key::KEY_RIGHTBRACE]),
         ]
@@ -166,7 +175,7 @@ impl DeviceDispatcher {
         }
 
         VirtualDeviceBuilder::new()?
-            .name("virtual_tablet")
+            .name("virtual_tablet_keyboard")
             .with_keys(&key_set)?
             .build()
     }
@@ -190,27 +199,31 @@ impl DeviceDispatcher {
         } {
             if let Some(keys) = self.tablet_button_id_to_key_code_map.get(&i) {
                 for &key in keys {
-                    self.virtual_keyboard
-                        .emit(&[InputEvent::new(EventType::KEY, key.code(), state)])
-                        .expect("Error emitting virtual keyboard key.");
+                    let _ = self.virtual_keyboard
+                        .emit(&[InputEvent::new(EventType::KEY, key.code(), state)]);
                 }
 
-                self.virtual_keyboard
+                let _ = self.virtual_keyboard
                     .emit(&[InputEvent::new(
                         EventType::SYNCHRONIZATION,
                         Synchronization::SYN_REPORT.0,
                         0,
-                    )])
-                    .expect("Error emitting SYN.");
+                    )]);
             }
         };
     }
 
     fn virtual_pen_builder(pen_emitted_keys: &[Key]) -> Result<VirtualDevice, Error> {
-        let abs_x_setup =
-            UinputAbsSetup::new(AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, 4096, 0, 0, 1));
-        let abs_y_setup =
-            UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, 4096, 0, 0, 1));
+        // Сбалансированный фиксированный ускоритель (resolution)
+        // 0 = нет ускорения, 1 = стандартный, 10-20 = быстрое ускорение движения
+        let abs_x_setup = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_X,
+            AbsInfo::new(0, 0, Self::VIRTUAL_MAX, 0, 0, 10),
+        );
+        let abs_y_setup = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_Y,
+            AbsInfo::new(0, 0, Self::VIRTUAL_MAX, 0, 0, 10),
+        );
         let abs_pressure_setup = UinputAbsSetup::new(
             AbsoluteAxisType::ABS_PRESSURE,
             AbsInfo::new(0, 0, 8191, 0, 0, 1),
@@ -221,12 +234,12 @@ impl DeviceDispatcher {
             key_set.insert(*key);
         }
 
-        for key in &[Key::BTN_TOOL_PEN, Key::BTN_LEFT, Key::BTN_RIGHT] {
+        for key in &[Key::BTN_TOOL_PEN, Key::BTN_LEFT, Key::BTN_RIGHT, Key::BTN_TOUCH] {
             key_set.insert(*key);
         }
 
         VirtualDeviceBuilder::new()?
-            .name("virtual_tablet")
+            .name("virtual_tablet_pen")
             .with_absolute_axis(&abs_x_setup)?
             .with_absolute_axis(&abs_y_setup)?
             .with_absolute_axis(&abs_pressure_setup)?
@@ -238,30 +251,46 @@ impl DeviceDispatcher {
         let raw_pen_buttons = raw_data.pen_buttons();
         self.raw_pen_buttons_to_pen_key_events(raw_pen_buttons);
         self.pen_last_raw_pressed_button = raw_pen_buttons;
-        let normalized_pressure = Self::normalize_pressure(raw_data.pressure());
-        self.raw_pen_abs_to_pen_abs_events(
-            raw_data.x_axis(),
-            raw_data.y_axis(),
-            normalized_pressure,
-        );
 
-        self.pen_emit_touch(raw_data);
+        let normalized_pressure = Self::normalize_pressure(raw_data.pressure());
+
+        let raw_x = raw_data.x_axis();
+        let raw_y = raw_data.y_axis();
+
+        // Смещаем координаты относительно центра
+        let centered_x = raw_x - Self::RAW_CENTER;
+        let centered_y = raw_y - Self::RAW_CENTER;
+
+        // Масштабируем с высокой чувствительностью
+        let scaled_x = (centered_x as f32 * Self::SCALE) as i32;
+        let scaled_y = (centered_y as f32 * Self::SCALE) as i32;
+
+        // Смещаем обратно к центру виртуального устройства и ограничиваем
+        let final_x = (scaled_x + Self::VIRTUAL_CENTER).max(0).min(Self::VIRTUAL_MAX);
+        let final_y = (scaled_y + Self::VIRTUAL_CENTER).max(0).min(Self::VIRTUAL_MAX);
+
+        // Батч эмит: отправляем все события за раз для снижения задержки
+        let mut events = vec![
+            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, final_x),
+            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, final_y),
+            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_PRESSURE.0, normalized_pressure),
+        ];
+
+        self.pen_emit_touch_to_events(raw_data, &mut events);
+
+        let _ = self.virtual_pen.emit(&events);
     }
 
     fn normalize_pressure(raw_pressure: i32) -> i32 {
         let proximity_threshold = 150;
         let pressure_value = 1740 - raw_pressure;
 
-        // Если давление ниже порога - касания нет
         if pressure_value <= proximity_threshold {
             return 0;
         }
 
-        // Максимально расширенный диапазон для максимальной степени нажатия
-        // Минимум (еле касание): 150 → 1500
-        // Максимум (сильное нажатие): 1750 → 8191
         let min_pressure = proximity_threshold;
-        let max_pressure = 1750;  // Повышено с 1700
+        let max_pressure = 1750;
 
         let clamped = pressure_value.min(max_pressure).max(min_pressure);
         let normalized = ((clamped - min_pressure) as i32 * 8191) / (max_pressure - min_pressure);
@@ -270,21 +299,21 @@ impl DeviceDispatcher {
     }
 
     fn raw_pen_abs_to_pen_abs_events(&mut self, x_axis: i32, y_axis: i32, pressure: i32) {
-        self.virtual_pen.emit(&[InputEvent::new(
+        let _ = self.virtual_pen.emit(&[InputEvent::new(
             EventType::ABSOLUTE,
             AbsoluteAxisType::ABS_X.0,
             x_axis,
-        )]).expect("Error emitting ABS_X.");
-        self.virtual_pen.emit(&[InputEvent::new(
+        )]);
+        let _ = self.virtual_pen.emit(&[InputEvent::new(
             EventType::ABSOLUTE,
             AbsoluteAxisType::ABS_Y.0,
             y_axis,
-        )]).expect("Error emitting ABS_Y.");
-        self.virtual_pen.emit(&[InputEvent::new(
+        )]);
+        let _ = self.virtual_pen.emit(&[InputEvent::new(
             EventType::ABSOLUTE,
             AbsoluteAxisType::ABS_PRESSURE.0,
             pressure,
-        )]).expect("Error emitting Pressure.");
+        )]);
     }
 
     fn pen_emit_touch(&mut self, raw_data: &RawDataReader) {
@@ -294,11 +323,27 @@ impl DeviceDispatcher {
             (true, false) => Some(Self::RELEASED),
             _ => None,
         } {
-            self.virtual_pen.emit(&[InputEvent::new(
+            let _ = self.virtual_pen.emit(&[InputEvent::new(
                 EventType::KEY,
                 Key::BTN_TOUCH.code(),
                 state,
-            )]).expect("Error emitting Touch");
+            )]);
+        }
+        self.was_touching = is_touching;
+    }
+
+    fn pen_emit_touch_to_events(&mut self, raw_data: &RawDataReader, events: &mut Vec<InputEvent>) {
+        let is_touching = Self::normalize_pressure(raw_data.pressure()) > 0;
+        if let Some(state) = match (self.was_touching, is_touching) {
+            (false, true) => Some(Self::PRESSED),
+            (true, false) => Some(Self::RELEASED),
+            _ => None,
+        } {
+            events.push(InputEvent::new(
+                EventType::KEY,
+                Key::BTN_TOUCH.code(),
+                state,
+            ));
         }
         self.was_touching = is_touching;
     }
@@ -310,14 +355,11 @@ impl DeviceDispatcher {
             (x, y) if x != 2 && x == y => Some((Self::HOLD, x)),
             _ => None,
         } {
-            let keys = self
-                .pen_button_id_to_key_code_map
-                .get(&id)
-                .expect("Error mapping pen keys.");
-            for key in keys {
-                self.virtual_pen
-                    .emit(&[InputEvent::new(EventType::KEY, key.code(), state)])
-                    .expect("Error emitting pen keys.")
+            if let Some(keys) = self.pen_button_id_to_key_code_map.get(&id) {
+                for key in keys {
+                    let _ = self.virtual_pen
+                        .emit(&[InputEvent::new(EventType::KEY, key.code(), state)]);
+                }
             }
         }
     }
