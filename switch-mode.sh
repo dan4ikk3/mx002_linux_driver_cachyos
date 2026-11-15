@@ -16,6 +16,7 @@ usage() {
     echo -e "    ${GREEN}draw${NC}        Собрать и запустить в режиме рисования"
     echo -e "    ${GREEN}osu${NC}         Собрать и запустить в режиме osu!"
     echo -e "    ${GREEN}calibrate${NC}   Показать диапазон давления пера (подбор --base/--max)"
+    echo -e "    ${GREEN}dump${NC}        Печать сырых отчётов планшета (диагностика)"
     echo -e "    ${GREEN}build${NC}       Только собрать"
     echo -e "    ${GREEN}help${NC}        Эта справка"
     echo
@@ -35,6 +36,7 @@ shift || true
 case "$cmd" in
     draw|osu)  build; exec "$BINARY_PATH" --mode "$cmd" "$@" ;;
     calibrate) build; exec "$BINARY_PATH" --calibrate "$@" ;;
+    dump)      build; exec "$BINARY_PATH" --dump "$@" ;;
     build)     build ;;
     help|-h|--help) usage ;;
     *) echo -e "${RED}Unknown command: $cmd${NC}"; usage; exit 1 ;;
