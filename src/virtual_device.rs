@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::io::Error;
+use std::time::{Duration, Instant};
 
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent, Key, UinputAbsSetup,
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, Key,
+    UinputAbsSetup,
 };
 
 use crate::config::{Config, Mode};
+use crate::filter::PenFilter;
+
+const USB_VID: u16 = 0x08f2;
+const USB_PID: u16 = 0x6811;
 
 #[derive(Default)]
 pub struct RawDataReader {
@@ -64,6 +70,35 @@ impl RawDataReader {
     }
 }
 
+/// Счётчик удержаний клавиш: одна и та же клавиша (Ctrl) может быть на нескольких
+/// кнопках планшета, и отпускание одной не должно снимать её, пока держится другая.
+#[derive(Default)]
+struct KeyRefs(HashMap<u16, u8>);
+
+impl KeyRefs {
+    /// true — клавишу надо реально нажать.
+    fn press(&mut self, code: u16) -> bool {
+        let n = self.0.entry(code).or_insert(0);
+        *n += 1;
+        *n == 1
+    }
+
+    /// true — клавишу надо реально отпустить.
+    fn release(&mut self, code: u16) -> bool {
+        match self.0.get_mut(&code) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                self.0.remove(&code);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 pub struct DeviceDispatcher {
     config: Config,
     tablet_last_raw_pressed_buttons: u16,
@@ -72,7 +107,11 @@ pub struct DeviceDispatcher {
     pen_button_id_to_key_code_map: HashMap<u8, Vec<Key>>,
     virtual_pen: VirtualDevice,
     virtual_keyboard: VirtualDevice,
+    key_refs: KeyRefs,
+    filter: PenFilter,
     was_touching: bool,
+    in_proximity: bool,
+    last_report: Instant,
     last_abs: Option<(i32, i32, i32)>,
 }
 
@@ -83,12 +122,9 @@ impl DeviceDispatcher {
     /// Максимум оси давления на виртуальном устройстве.
     pub const PRESSURE_MAX: i32 = 8191;
 
-    // Режим osu!: координаты планшета 0..4096 растягиваются вокруг центра.
-    const OSU_RAW_CENTER: i32 = 2048;
+    // Режим osu!: координаты планшета растягиваются вокруг центра.
     const OSU_VIRTUAL_MAX: i32 = 8191;
     const OSU_VIRTUAL_CENTER: i32 = 4095;
-    // Режим рисования: полная область планшета.
-    const DRAW_MAX: i32 = 4096;
 
     pub fn new(config: Config) -> Self {
         let tablet_map: HashMap<u8, Vec<Key>> = [
@@ -120,17 +156,18 @@ impl DeviceDispatcher {
 
         let virtual_pen = Self::virtual_pen_builder(
             pen_name,
-            config.mode,
+            &config,
             &pen_map.values().flatten().cloned().collect::<Vec<Key>>(),
         )
-        .expect("Error building virtual pen");
+        .expect("Error building virtual pen (нет доступа к /dev/uinput?)");
         let virtual_keyboard = Self::virtual_keyboard_builder(
             kbd_name,
             &tablet_map.values().flatten().cloned().collect::<Vec<Key>>(),
         )
-        .expect("Error building virtual keyboard");
+        .expect("Error building virtual keyboard (нет доступа к /dev/uinput?)");
 
         DeviceDispatcher {
+            filter: PenFilter::new(config.smooth),
             config,
             tablet_last_raw_pressed_buttons: 0xFFFF,
             pen_last_raw_pressed_button: 0,
@@ -138,14 +175,41 @@ impl DeviceDispatcher {
             pen_button_id_to_key_code_map: pen_map,
             virtual_pen,
             virtual_keyboard,
+            key_refs: KeyRefs::default(),
             was_touching: false,
+            in_proximity: false,
+            last_report: Instant::now(),
             last_abs: None,
         }
     }
 
     pub fn dispatch(&mut self, raw_data: &RawDataReader) {
+        self.last_report = Instant::now();
         self.emit_pen_events(raw_data);
         self.emit_tablet_events(raw_data);
+    }
+
+    /// Вызывается, когда новых отчётов нет: определяет выход пера из зоны.
+    pub fn idle(&mut self) {
+        if !self.config.proximity || !self.in_proximity {
+            return;
+        }
+        if self.last_report.elapsed() < Duration::from_millis(self.config.prox_timeout_ms) {
+            return;
+        }
+        let mut events = Vec::with_capacity(4);
+        if self.was_touching {
+            events.push(InputEvent::new(EventType::KEY, Key::BTN_TOUCH.code(), Self::RELEASED));
+            events.push(InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_PRESSURE.0, 0));
+            self.was_touching = false;
+        }
+        events.push(InputEvent::new(EventType::KEY, Key::BTN_TOOL_PEN.code(), Self::RELEASED));
+        self.in_proximity = false;
+        self.last_abs = None;
+        self.filter.reset();
+        if let Err(e) = self.virtual_pen.emit(&events) {
+            eprintln!("Error emitting pen proximity-out: {e}");
+        }
     }
 
     // ---------------------------------------------------------------- клавиатура
@@ -157,6 +221,7 @@ impl DeviceDispatcher {
         }
         VirtualDeviceBuilder::new()?
             .name(name)
+            .input_id(InputId::new(BusType::BUS_USB, USB_VID, USB_PID, 1))
             .with_keys(&key_set)?
             .build()
     }
@@ -175,16 +240,20 @@ impl DeviceDispatcher {
             if is_pressed == was_pressed {
                 continue;
             }
-            let state = if is_pressed { Self::PRESSED } else { Self::RELEASED };
-            if let Some(keys) = self.tablet_button_id_to_key_code_map.get(&i) {
-                // Отпускаем в обратном порядке, чтобы комбинации (Ctrl+...) были корректны.
-                if is_pressed {
-                    for key in keys {
-                        events.push(InputEvent::new(EventType::KEY, key.code(), state));
+            let Some(keys) = self.tablet_button_id_to_key_code_map.get(&i) else {
+                continue;
+            };
+            if is_pressed {
+                for key in keys {
+                    if self.key_refs.press(key.code()) {
+                        events.push(InputEvent::new(EventType::KEY, key.code(), Self::PRESSED));
                     }
-                } else {
-                    for key in keys.iter().rev() {
-                        events.push(InputEvent::new(EventType::KEY, key.code(), state));
+                }
+            } else {
+                // Обратный порядок: сначала снимаем клавишу, потом модификатор.
+                for key in keys.iter().rev() {
+                    if self.key_refs.release(key.code()) {
+                        events.push(InputEvent::new(EventType::KEY, key.code(), Self::RELEASED));
                     }
                 }
             }
@@ -201,13 +270,19 @@ impl DeviceDispatcher {
 
     // ---------------------------------------------------------------- перо
 
-    fn virtual_pen_builder(name: &str, mode: Mode, pen_keys: &[Key]) -> Result<VirtualDevice, Error> {
-        let (max_xy, res) = match mode {
-            Mode::Draw => (Self::DRAW_MAX, 1),
-            Mode::Osu => (Self::OSU_VIRTUAL_MAX, 10),
+    fn virtual_pen_builder(name: &str, config: &Config, pen_keys: &[Key]) -> Result<VirtualDevice, Error> {
+        let (max_x, max_y, res_x, res_y) = match config.mode {
+            Mode::Draw => {
+                let (rx, ry) = Self::resolution(config, config.max_x, config.max_y, 1);
+                (config.max_x, config.max_y, rx, ry)
+            }
+            Mode::Osu => {
+                let (rx, ry) = Self::resolution(config, Self::OSU_VIRTUAL_MAX, Self::OSU_VIRTUAL_MAX, 10);
+                (Self::OSU_VIRTUAL_MAX, Self::OSU_VIRTUAL_MAX, rx, ry)
+            }
         };
-        let abs_x = UinputAbsSetup::new(AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, max_xy, 0, 0, res));
-        let abs_y = UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, max_xy, 0, 0, res));
+        let abs_x = UinputAbsSetup::new(AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, max_x, 0, 0, res_x));
+        let abs_y = UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, max_y, 0, 0, res_y));
         let abs_pressure = UinputAbsSetup::new(
             AbsoluteAxisType::ABS_PRESSURE,
             AbsInfo::new(0, 0, Self::PRESSURE_MAX, 0, 0, 0),
@@ -225,6 +300,7 @@ impl DeviceDispatcher {
 
         VirtualDeviceBuilder::new()?
             .name(name)
+            .input_id(InputId::new(BusType::BUS_USB, USB_VID, USB_PID, 1))
             .with_absolute_axis(&abs_x)?
             .with_absolute_axis(&abs_y)?
             .with_absolute_axis(&abs_pressure)?
@@ -232,26 +308,50 @@ impl DeviceDispatcher {
             .build()
     }
 
+    /// Разрешение осей (единиц на мм). Без `--size` — прежние значения.
+    fn resolution(config: &Config, max_x: i32, max_y: i32, fallback: i32) -> (i32, i32) {
+        match config.size_mm {
+            Some((w, h)) if w > 0.0 && h > 0.0 => (
+                ((max_x as f32 / w).round() as i32).max(1),
+                ((max_y as f32 / h).round() as i32).max(1),
+            ),
+            _ => (fallback, fallback),
+        }
+    }
+
     fn process_pressure(&self, raw_pressure: i32) -> (bool, i32) {
         self.config.pressure(self.was_touching, raw_pressure, Self::PRESSURE_MAX)
     }
 
-    fn map_xy(&self, raw_x: i32, raw_y: i32) -> (i32, i32) {
-        match self.config.mode {
-            Mode::Draw => (raw_x, raw_y),
+    /// Сырые координаты (после фильтра) -> координаты виртуального устройства.
+    fn map_xy(&self, x: f32, y: f32) -> (i32, i32) {
+        let c = &self.config;
+        match c.mode {
+            Mode::Draw => (
+                (x.round() as i32).clamp(0, c.max_x),
+                (y.round() as i32).clamp(0, c.max_y),
+            ),
             Mode::Osu => {
-                let s = self.config.osu_scale;
-                let f = |v: i32| {
-                    (((v - Self::OSU_RAW_CENTER) as f32 * s) as i32 + Self::OSU_VIRTUAL_CENTER)
+                let f = |v: f32, raw_max: i32| {
+                    let center = raw_max as f32 / 2.0;
+                    (((v - center) * c.osu_scale).round() as i32 + Self::OSU_VIRTUAL_CENTER)
                         .clamp(0, Self::OSU_VIRTUAL_MAX)
                 };
-                (f(raw_x), f(raw_y))
+                (f(x, c.max_x), f(y, c.max_y))
             }
         }
     }
 
     fn emit_pen_events(&mut self, raw_data: &RawDataReader) {
-        let mut events: Vec<InputEvent> = Vec::with_capacity(8);
+        let mut events: Vec<InputEvent> = Vec::with_capacity(10);
+
+        // вход пера в зону — раньше любых осей и в том же кадре
+        if self.config.proximity && !self.in_proximity {
+            events.push(InputEvent::new(EventType::KEY, Key::BTN_TOOL_PEN.code(), Self::PRESSED));
+            self.in_proximity = true;
+            self.filter.reset();
+            self.last_abs = None;
+        }
 
         // кнопки пера
         let raw_pen_buttons = raw_data.pen_buttons();
@@ -259,7 +359,10 @@ impl DeviceDispatcher {
         self.pen_last_raw_pressed_button = raw_pen_buttons;
 
         // оси
-        let (x, y) = self.map_xy(raw_data.x_axis(), raw_data.y_axis());
+        let (fx, fy) = self
+            .filter
+            .apply(raw_data.x_axis() as f32, raw_data.y_axis() as f32);
+        let (x, y) = self.map_xy(fx, fy);
         let (is_touching, pressure) = self.process_pressure(raw_data.pressure());
 
         if self.last_abs != Some((x, y, pressure)) {
@@ -302,6 +405,7 @@ impl DeviceDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use super::KeyRefs;
     use crate::config::Config;
 
     fn press(c: &Config, touching: bool, raw: i32) -> (bool, i32) {
@@ -330,5 +434,15 @@ mod tests {
         // мягкая кривая даёт больше давления на средних нажимах
         let soft = Config { curve: 0.7, ..Config::default() };
         assert!(press(&soft, false, 1740 - 400).1 > press(&c, false, 1740 - 400).1);
+    }
+
+    #[test]
+    fn shared_modifier_stays_pressed() {
+        let mut k = KeyRefs::default();
+        assert!(k.press(29)); // Ctrl (кнопка 3) — реально нажат
+        assert!(!k.press(29)); // Ctrl (кнопка 7) — уже нажат
+        assert!(!k.release(29)); // отпустили кнопку 7 — Ctrl ещё держится кнопкой 3
+        assert!(k.release(29)); // отпустили кнопку 3 — теперь Ctrl отпущен
+        assert!(!k.release(29)); // лишний release игнорируется
     }
 }

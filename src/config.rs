@@ -19,6 +19,17 @@ pub struct Config {
     pub curve: f32,
     /// Множитель координат в режиме osu!.
     pub osu_scale: f32,
+    /// Сглаживание позиции пера: 0.0 — выкл., 0.9 — максимум. Быстрые движения не страдают.
+    pub smooth: f32,
+    /// Размер рабочей области сырых координат планшета.
+    pub max_x: i32,
+    pub max_y: i32,
+    /// Физический размер рабочей области в мм (для разрешения осей и сохранения пропорций).
+    pub size_mm: Option<(f32, f32)>,
+    /// Отправлять вход/выход пера из зоны (BTN_TOOL_PEN), как обычные планшеты.
+    pub proximity: bool,
+    /// Через сколько мс без отчётов считаем, что перо вышло из зоны.
+    pub prox_timeout_ms: u64,
     pub calibrate: bool,
 }
 
@@ -32,6 +43,12 @@ impl Default for Config {
             max_delta: 700,
             curve: 1.0,
             osu_scale: 8.0,
+            smooth: 0.0,
+            max_x: 4096,
+            max_y: 4096,
+            size_mm: None,
+            proximity: true,
+            prox_timeout_ms: 100,
             calibrate: false,
         }
     }
@@ -60,6 +77,7 @@ impl Config {
 
     pub fn from_args() -> Result<Config, String> {
         let mut c = Config::default();
+        let mut smooth_set = false;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             let mut value = |name: &str| -> Result<String, String> {
@@ -78,6 +96,21 @@ impl Config {
                 "--max" => c.max_delta = parse(&value("--max")?)?,
                 "--curve" => c.curve = parse(&value("--curve")?)?,
                 "--scale" => c.osu_scale = parse(&value("--scale")?)?,
+                "--smooth" => {
+                    c.smooth = parse(&value("--smooth")?)?;
+                    smooth_set = true;
+                }
+                "--max-x" => c.max_x = parse(&value("--max-x")?)?,
+                "--max-y" => c.max_y = parse(&value("--max-y")?)?,
+                "--size" => {
+                    let v = value("--size")?;
+                    let (w, h) = v
+                        .split_once('x')
+                        .ok_or("--size ожидает формат ШИРИНАxВЫСОТА в мм, например 254x158")?;
+                    c.size_mm = Some((parse(w)?, parse(h)?));
+                }
+                "--no-proximity" => c.proximity = false,
+                "--prox-timeout" => c.prox_timeout_ms = parse(&value("--prox-timeout")?)?,
                 "--calibrate" => c.calibrate = true,
                 "--help" | "-h" => return Err(Self::usage()),
                 other => return Err(format!("неизвестный аргумент: {other}\n{}", Self::usage())),
@@ -85,6 +118,17 @@ impl Config {
         }
         if c.max_delta <= c.threshold {
             return Err("--max должен быть больше --threshold".into());
+        }
+        // В osu! дрожание сенсора усиливается множителем координат, поэтому сглаживание
+        // там включено по умолчанию (быстрые движения проходят без задержки).
+        if !smooth_set && c.mode == Mode::Osu {
+            c.smooth = 0.5;
+        }
+        if c.max_x <= 0 || c.max_y <= 0 {
+            return Err("--max-x и --max-y должны быть > 0".into());
+        }
+        if !(0.0..=0.9).contains(&c.smooth) {
+            return Err("--smooth должен быть в диапазоне 0.0..0.9".into());
         }
         if c.curve <= 0.0 {
             return Err("--curve должен быть > 0".into());
@@ -94,13 +138,19 @@ impl Config {
 
     pub fn usage() -> String {
         "Использование: mx002 [--mode draw|osu] [--base N] [--threshold N] [--max N] \
-         [--curve F] [--scale F] [--calibrate]\n\
+         [--curve F] [--scale F] [--smooth F]\n\
+         \x20        [--max-x N] [--max-y N] [--size WxH] [--no-proximity] [--prox-timeout MS] [--calibrate]\n\
          \n  --mode       draw (по умолчанию) или osu\
          \n  --base       сырое давление в покое (по умолчанию 1740)\
          \n  --threshold  порог касания (150)\
          \n  --max        нажим, дающий 100% давления (700)\
          \n  --curve      кривая давления, 1.0 линейно, <1.0 мягче (1.0)\
          \n  --scale      множитель координат для osu (8.0)\
+         \n  --smooth     сглаживание позиции 0.0..0.9 (draw: 0, osu: 0.5)\
+         \n  --max-x/-y   размер области сырых координат (4096) — подбирается --calibrate\
+         \n  --size WxH   физический размер рабочей области, мм (для пропорций и разрешения осей)\
+         \n  --no-proximity  не отправлять вход/выход пера из зоны\
+         \n  --prox-timeout  мс без отчётов до «пера нет в зоне» (100)\
          \n  --calibrate  показать диапазон давления вашего пера и выйти"
             .into()
     }
