@@ -2,20 +2,23 @@
 
 This README provides information about the Linux user-space driver for the graphics tablet sold in Brazil as the Multilaser MX002. The driver supports various rebranded versions of the same device.
 
-# Changes made:
-Added a small snippet to regulate the touch and pen proximity sensitivity.Other things like strength of the line are also taken on consideration,even though not tested.The changes can be made in this snippet:
+# Changes made (fork)
 
-    fn normalize_pressure(raw_pressure: i32) -> i32 {
-        let proximity_threshold = 600; // Adjust for proximity sensitivity
-        let strength_scaling = 2; // Adjust for strength of the press
-    
-        match 1740 - raw_pressure {
-            x if x <= proximity_threshold => 0,
-            x => x * strength_scaling, // Scale the pressure for stronger presses
-        }
-    }
+- Режимы `draw` и `osu` теперь выбираются аргументом `--mode`, один исходник вместо двух копий.
+- Все события пера (X, Y, давление, касание, кнопки) уходят одним кадром, а не 4–5 отдельными.
+- В режиме рисования `BTN_TOUCH` не был объявлен у виртуального устройства, и ядро молча его отбрасывало. Исправлено.
+- Шкала давления: 100% достигается при `--max` (по умолчанию 700 — то, что реально используется), гистерезис касания, настраиваемая кривая `--curve`.
+- Корректное завершение при отключении планшета (раньше — загрузка CPU на 100%), быстрый выход по Ctrl+C.
 
-Be wary that the lower the threshold goes,the more probable it is for the pen to be detected wrongly.Make it a very big number,and the touch will stop working(But the rover will still woker.
+## Настройка давления
+
+```bash
+./switch-mode.sh calibrate        # понажимайте пером как при рисовании, затем Ctrl+C
+./switch-mode.sh draw --base 1740 --threshold 120 --max 650 --curve 0.8
+```
+
+`--calibrate` печатает рекомендуемые `--base/--threshold/--max` для вашего пера. Не давите сильнее обычного: по оценке автора оригинала, выше ~700 уровней есть риск повредить перо.
+
 ## Supported Devices
 
 This driver is intended for use with the following devices:
