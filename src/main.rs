@@ -34,6 +34,11 @@ fn main() {
     physical_device.init().set_full_mode();
     let mut data_reader = RawDataReader::new();
 
+    if config.dump {
+        dump(&physical_device, &mut data_reader, &stop);
+        return;
+    }
+
     if config.calibrate {
         calibrate(&physical_device, &mut data_reader, &stop, &config);
         return;
@@ -93,4 +98,26 @@ fn calibrate(dev: &PhysicalDevice, reader: &mut RawDataReader, stop: &AtomicBool
     println!("(сейчас base={}, threshold={}, max={})", cfg.base, cfg.threshold, cfg.max_delta);
     println!("Координаты: x_max={max_x}, y_max={max_y} (проведите пером по всем краям планшета).");
     println!("Если значения заметно отличаются от 4096, добавьте --max-x {max_x} --max-y {max_y}");
+}
+
+/// Печатает сырые отчёты (hex), когда меняется что-то кроме X/Y.
+/// Как пользоваться: подержите перо над планшетом, уберите его, понажимайте кнопки пера
+/// и планшета, затем Ctrl+C. По изменениям байт видно, какой из них означает «перо вне зоны».
+fn dump(dev: &PhysicalDevice, reader: &mut RawDataReader, stop: &AtomicBool) {
+    println!("Дамп отчётов: меняется всё, кроме байт X/Y (1..4). Ctrl+C — выход.");
+    let mut last: Vec<u8> = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        if let Ok(n) = dev.read_device_responses(&mut reader.data) {
+            let n = n.min(reader.data.len());
+            let mut key = reader.data[..n].to_vec();
+            for b in key.iter_mut().take(5).skip(1) {
+                *b = 0; // X/Y не учитываем при сравнении
+            }
+            if key != last {
+                let hex: Vec<String> = reader.data[..n].iter().map(|b| format!("{b:02x}")).collect();
+                println!("[{n:2}] {}", hex.join(" "));
+                last = key;
+            }
+        }
+    }
 }

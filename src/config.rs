@@ -31,6 +31,8 @@ pub struct Config {
     /// Через сколько мс без отчётов считаем, что перо вышло из зоны.
     pub prox_timeout_ms: u64,
     pub calibrate: bool,
+    /// Диагностика: печатать сырые отчёты планшета (для поиска байта «перо вне зоны»).
+    pub dump: bool,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Default for Config {
             proximity: true,
             prox_timeout_ms: 100,
             calibrate: false,
+            dump: false,
         }
     }
 }
@@ -76,9 +79,13 @@ impl Config {
     }
 
     pub fn from_args() -> Result<Config, String> {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
         let mut c = Config::default();
         let mut smooth_set = false;
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let mut value = |name: &str| -> Result<String, String> {
                 args.next().ok_or_else(|| format!("{name} требует значение"))
@@ -112,6 +119,7 @@ impl Config {
                 "--no-proximity" => c.proximity = false,
                 "--prox-timeout" => c.prox_timeout_ms = parse(&value("--prox-timeout")?)?,
                 "--calibrate" => c.calibrate = true,
+                "--dump" => c.dump = true,
                 "--help" | "-h" => return Err(Self::usage()),
                 other => return Err(format!("неизвестный аргумент: {other}\n{}", Self::usage())),
             }
@@ -139,7 +147,7 @@ impl Config {
     pub fn usage() -> String {
         "Использование: mx002 [--mode draw|osu] [--base N] [--threshold N] [--max N] \
          [--curve F] [--scale F] [--smooth F]\n\
-         \x20        [--max-x N] [--max-y N] [--size WxH] [--no-proximity] [--prox-timeout MS] [--calibrate]\n\
+         \x20        [--max-x N] [--max-y N] [--size WxH] [--no-proximity] [--prox-timeout MS] [--calibrate] [--dump]\n\
          \n  --mode       draw (по умолчанию) или osu\
          \n  --base       сырое давление в покое (по умолчанию 1740)\
          \n  --threshold  порог касания (150)\
@@ -151,11 +159,61 @@ impl Config {
          \n  --size WxH   физический размер рабочей области, мм (для пропорций и разрешения осей)\
          \n  --no-proximity  не отправлять вход/выход пера из зоны\
          \n  --prox-timeout  мс без отчётов до «пера нет в зоне» (100)\
-         \n  --calibrate  показать диапазон давления вашего пера и выйти"
+         \n  --calibrate  показать диапазон давления и координат вашего пера и выйти\
+         \n  --dump       печатать сырые отчёты планшета (диагностика) и выйти"
             .into()
     }
 }
 
 fn parse<T: std::str::FromStr>(s: &str) -> Result<T, String> {
     s.parse().map_err(|_| format!("не удалось разобрать значение: {s}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(args: &[&str]) -> Result<Config, String> {
+        Config::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_for_draw() {
+        let c = parse_args(&[]).unwrap();
+        assert_eq!(c.mode, Mode::Draw);
+        assert_eq!(c.smooth, 0.0);
+        assert!(c.proximity);
+    }
+
+    #[test]
+    fn osu_enables_smoothing_unless_overridden() {
+        assert_eq!(parse_args(&["--mode", "osu"]).unwrap().smooth, 0.5);
+        assert_eq!(parse_args(&["--mode", "osu", "--smooth", "0"]).unwrap().smooth, 0.0);
+        assert_eq!(parse_args(&["--smooth", "0.3", "--mode", "osu"]).unwrap().smooth, 0.3);
+    }
+
+    #[test]
+    fn size_and_axes() {
+        let c = parse_args(&["--size", "254x158", "--max-x", "4000", "--max-y", "2500"]).unwrap();
+        assert_eq!(c.size_mm, Some((254.0, 158.0)));
+        assert_eq!((c.max_x, c.max_y), (4000, 2500));
+        assert!(parse_args(&["--size", "254"]).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        assert!(parse_args(&["--mode", "foo"]).is_err());
+        assert!(parse_args(&["--max", "100"]).is_err()); // не больше threshold
+        assert!(parse_args(&["--smooth", "1.5"]).is_err());
+        assert!(parse_args(&["--curve", "0"]).is_err());
+        assert!(parse_args(&["--max-x", "0"]).is_err());
+        assert!(parse_args(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn proximity_flags() {
+        let c = parse_args(&["--no-proximity", "--prox-timeout", "250"]).unwrap();
+        assert!(!c.proximity);
+        assert_eq!(c.prox_timeout_ms, 250);
+    }
 }
