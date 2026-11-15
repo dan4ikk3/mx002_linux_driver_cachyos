@@ -52,7 +52,7 @@ impl PhysicalDevice {
 
     pub fn read_device_responses(&self, buffer: &mut [u8]) -> Result<usize, RusbError> {
         self.device_handle
-            .read_interrupt(self.endpoint_address, buffer, Duration::from_millis(100))
+            .read_interrupt(self.endpoint_address, buffer, Duration::from_millis(25))
     }
 
     pub fn set_full_mode(&mut self) -> &mut Self {
