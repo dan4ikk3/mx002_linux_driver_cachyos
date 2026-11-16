@@ -42,6 +42,50 @@ impl PenFilter {
     }
 }
 
+/// Подавляет фантомные касания: касание начинается только после `need` подряд идущих
+/// отчётов выше порога (одиночный всплеск шума не считается), а заканчивается сразу.
+#[derive(Debug, Clone)]
+pub struct TouchTracker {
+    need: u32,
+    streak: u32,
+    touching: bool,
+}
+
+impl TouchTracker {
+    pub fn new(need: u32) -> Self {
+        TouchTracker {
+            need: need.max(1),
+            streak: 0,
+            touching: false,
+        }
+    }
+
+    pub fn touching(&self) -> bool {
+        self.touching
+    }
+
+    /// `over` — давление в этом отчёте выше порога. Возвращает текущее состояние касания.
+    pub fn update(&mut self, over: bool) -> bool {
+        if self.touching {
+            if !over {
+                self.touching = false;
+                self.streak = 0;
+            }
+        } else if over {
+            self.streak += 1;
+            self.touching = self.streak >= self.need;
+        } else {
+            self.streak = 0;
+        }
+        self.touching
+    }
+
+    pub fn reset(&mut self) {
+        self.streak = 0;
+        self.touching = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +119,31 @@ mod tests {
         f.apply(0.0, 0.0);
         let (x, _) = f.apply(30.0, 0.0); // быстрый рывок
         assert!(x > 29.9, "fast move should pass through, got {x}");
+    }
+
+    #[test]
+    fn single_spike_is_not_a_touch() {
+        let mut t = TouchTracker::new(2);
+        assert!(!t.update(true)); // одиночный всплеск
+        assert!(!t.update(false));
+        assert!(!t.update(true));
+        assert!(t.update(true)); // два подряд — касание
+        assert!(t.update(true));
+        assert!(!t.update(false)); // отпускание — сразу
+    }
+
+    #[test]
+    fn need_one_is_immediate() {
+        let mut t = TouchTracker::new(1);
+        assert!(t.update(true));
+        assert!(!t.update(false));
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let mut t = TouchTracker::new(1);
+        t.update(true);
+        t.reset();
+        assert!(!t.touching());
     }
 }
