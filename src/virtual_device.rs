@@ -9,7 +9,7 @@ use evdev::{
 };
 
 use crate::config::{Config, Mode};
-use crate::filter::PenFilter;
+use crate::filter::{PenFilter, TouchTracker};
 
 const USB_VID: u16 = 0x08f2;
 const USB_PID: u16 = 0x6811;
@@ -109,6 +109,7 @@ pub struct DeviceDispatcher {
     virtual_keyboard: VirtualDevice,
     key_refs: KeyRefs,
     filter: PenFilter,
+    touch: TouchTracker,
     was_touching: bool,
     in_proximity: bool,
     last_report: Instant,
@@ -168,6 +169,7 @@ impl DeviceDispatcher {
 
         DeviceDispatcher {
             filter: PenFilter::new(config.smooth),
+            touch: TouchTracker::new(config.debounce),
             config,
             tablet_last_raw_pressed_buttons: 0xFFFF,
             pen_last_raw_pressed_button: 0,
@@ -207,6 +209,7 @@ impl DeviceDispatcher {
         self.in_proximity = false;
         self.last_abs = None;
         self.filter.reset();
+        self.touch.reset();
         if let Err(e) = self.virtual_pen.emit(&events) {
             eprintln!("Error emitting pen proximity-out: {e}");
         }
@@ -319,8 +322,13 @@ impl DeviceDispatcher {
         }
     }
 
-    fn process_pressure(&self, raw_pressure: i32) -> (bool, i32) {
-        self.config.pressure(self.was_touching, raw_pressure, Self::PRESSURE_MAX)
+    /// (касается ли, давление). Касание подтверждается несколькими отчётами подряд.
+    fn process_pressure(&mut self, raw_pressure: i32) -> (bool, i32) {
+        let (over, value) =
+            self.config
+                .pressure(self.touch.touching(), raw_pressure, Self::PRESSURE_MAX);
+        let touching = self.touch.update(over);
+        (touching, if touching { value } else { 0 })
     }
 
     /// Сырые координаты (после фильтра) -> координаты виртуального устройства.
@@ -350,6 +358,7 @@ impl DeviceDispatcher {
             events.push(InputEvent::new(EventType::KEY, Key::BTN_TOOL_PEN.code(), Self::PRESSED));
             self.in_proximity = true;
             self.filter.reset();
+            self.touch.reset();
             self.last_abs = None;
         }
 

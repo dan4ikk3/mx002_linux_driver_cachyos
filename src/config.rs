@@ -27,6 +27,9 @@ pub struct Config {
     /// Физический размер рабочей области в мм (для разрешения осей и сохранения пропорций).
     pub size_mm: Option<(f32, f32)>,
     /// Отправлять вход/выход пера из зоны (BTN_TOOL_PEN), как обычные планшеты.
+    /// Сколько отчётов подряд давление должно быть выше порога, чтобы началось касание
+    /// (защита от фантомных нажатий). 1 — без защиты.
+    pub debounce: u32,
     pub proximity: bool,
     /// Через сколько мс без отчётов считаем, что перо вышло из зоны.
     pub prox_timeout_ms: u64,
@@ -49,6 +52,7 @@ impl Default for Config {
             max_x: 4096,
             max_y: 4096,
             size_mm: None,
+            debounce: 2,
             proximity: true,
             prox_timeout_ms: 100,
             calibrate: false,
@@ -116,6 +120,7 @@ impl Config {
                         .ok_or("--size ожидает формат ШИРИНАxВЫСОТА в мм, например 254x158")?;
                     c.size_mm = Some((parse(w)?, parse(h)?));
                 }
+                "--debounce" => c.debounce = parse(&value("--debounce")?)?,
                 "--no-proximity" => c.proximity = false,
                 "--prox-timeout" => c.prox_timeout_ms = parse(&value("--prox-timeout")?)?,
                 "--calibrate" => c.calibrate = true,
@@ -132,6 +137,9 @@ impl Config {
         if !smooth_set && c.mode == Mode::Osu {
             c.smooth = 0.5;
         }
+        if !(1..=10).contains(&c.debounce) {
+            return Err("--debounce должен быть в диапазоне 1..10".into());
+        }
         if c.max_x <= 0 || c.max_y <= 0 {
             return Err("--max-x и --max-y должны быть > 0".into());
         }
@@ -147,7 +155,7 @@ impl Config {
     pub fn usage() -> String {
         "Использование: mx002 [--mode draw|osu] [--base N] [--threshold N] [--max N] \
          [--curve F] [--scale F] [--smooth F]\n\
-         \x20        [--max-x N] [--max-y N] [--size WxH] [--no-proximity] [--prox-timeout MS] [--calibrate] [--dump]\n\
+         \x20        [--max-x N] [--max-y N] [--size WxH] [--debounce N] [--no-proximity] [--prox-timeout MS] [--calibrate] [--dump]\n\
          \n  --mode       draw (по умолчанию) или osu\
          \n  --base       сырое давление в покое (по умолчанию 1740)\
          \n  --threshold  порог касания (150)\
@@ -157,6 +165,7 @@ impl Config {
          \n  --smooth     сглаживание позиции 0.0..0.9 (draw: 0, osu: 0.5)\
          \n  --max-x/-y   размер области сырых координат (4096) — подбирается --calibrate\
          \n  --size WxH   физический размер рабочей области, мм (для пропорций и разрешения осей)\
+         \n  --debounce   отчётов подряд выше порога до касания, защита от фантомных нажатий (2)\
          \n  --no-proximity  не отправлять вход/выход пера из зоны\
          \n  --prox-timeout  мс без отчётов до «пера нет в зоне» (100)\
          \n  --calibrate  показать диапазон давления и координат вашего пера и выйти\
@@ -208,6 +217,14 @@ mod tests {
         assert!(parse_args(&["--curve", "0"]).is_err());
         assert!(parse_args(&["--max-x", "0"]).is_err());
         assert!(parse_args(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn debounce_option() {
+        assert_eq!(parse_args(&[]).unwrap().debounce, 2);
+        assert_eq!(parse_args(&["--debounce", "1"]).unwrap().debounce, 1);
+        assert!(parse_args(&["--debounce", "0"]).is_err());
+        assert!(parse_args(&["--debounce", "11"]).is_err());
     }
 
     #[test]

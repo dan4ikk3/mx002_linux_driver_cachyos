@@ -1,144 +1,230 @@
-# MX002 Linux User-Space Driver
+# MX002 — пользовательский драйвер графического планшета для Linux
 
-This README provides information about the Linux user-space driver for the graphics tablet sold in Brazil as the Multilaser MX002. The driver supports various rebranded versions of the same device.
+[English version](README.en.md)
 
-# Changes made (fork)
+Драйвер в пользовательском пространстве (user-space) для графического планшета, который в Бразилии продаётся как Multilaser MX002. Работает и с другими брендами на той же основе. Драйвер читает сырые отчёты планшета по USB и создаёт виртуальные устройства ввода (перо и кнопки), которые видят X11, Wayland и любые программы.
 
-- Режимы `draw` и `osu` теперь выбираются аргументом `--mode`, один исходник вместо двух копий.
-- Все события пера (X, Y, давление, касание, кнопки) уходят одним кадром, а не 4–5 отдельными.
-- В режиме рисования `BTN_TOUCH` не был объявлен у виртуального устройства, и ядро молча его отбрасывало. Исправлено.
-- Шкала давления: 100% достигается при `--max` (по умолчанию 700 — то, что реально используется), гистерезис касания, настраиваемая кривая `--curve`.
-- Корректное завершение при отключении планшета (раньше — загрузка CPU на 100%), быстрый выход по Ctrl+C.
+Два режима работы:
 
-## Как у обычных планшетов (draw)
+- **draw** — рисование: вся рабочая область, давление, вход и выход пера из зоны, как у обычных планшетов;
+- **osu** — игра в osu!: увеличенная чувствительность и адаптивное сглаживание, подавляющее дрожание без задержки на быстрых движениях.
 
-- Перо отправляет вход/выход из зоны (`BTN_TOOL_PEN`): `--prox-timeout MS` (по умолчанию 100), отключается `--no-proximity`.
-- Устройства представляются как USB `08f2:6811`.
-- Выход пера из зоны сейчас определяется по паузе в отчётах. Чтобы сделать это точно, запустите `./switch-mode.sh dump` (подержите перо над планшетом, уберите его, понажимайте кнопки, затем Ctrl+C) и приложите вывод к issue.
-- Размер области и пропорции: `--max-x/--max-y` (сырые координаты, проверьте через `calibrate`) и `--size WxH` (мм). С `--size` оси получают реальное разрешение, и компоситор может сохранять пропорции.
-- Кнопки с общим модификатором (Ctrl на кнопках 3, 7, 8) больше не отпускают Ctrl, пока удерживается другая.
+## Поддерживаемые устройства
 
-## osu!
-
-- Включено адаптивное сглаживание позиции (`--smooth 0.5`, диапазон 0.0..0.9): дрожание сенсора, которое множитель `--scale` усиливает в 8 раз, подавляется, а быстрые движения проходят без задержки. Для чистой «сырой» позиции: `--smooth 0`.
-- Время чтения USB сокращено до 25 мс, события отправляются только при изменении.
-
-## Настройка давления
-
-```bash
-./switch-mode.sh calibrate        # понажимайте пером как при рисовании, затем Ctrl+C
-./switch-mode.sh draw --base 1740 --threshold 120 --max 650 --curve 0.8
-```
-
-`--calibrate` печатает рекомендуемые `--base/--threshold/--max` для вашего пера. Не давите сильнее обычного: по оценке автора оригинала, выше ~700 уровней есть риск повредить перо.
-
-## Supported Devices
-
-This driver is intended for use with the following devices:
 - Multilaser MX002
 - VINSA 1060Plus
 - Gotop Information Inc. [T501] Driver Inside Tablet
-- 10moons G10/1060plus
+- 10moons G10 / 1060plus
 
-To check if this driver is compatible with your device, you can run the following command:
+Проверить, подходит ли ваш планшет:
 
 ```bash
 lsusb | grep 08f2:6811
 ```
 
-If your device is supported, the output should look similar to this:
+Ожидаемый вывод похож на:
 
 ```
 Bus 001 Device 005: ID 08f2:6811 Gotop Information Inc. [T501] Driver Inside Tablet
 ```
 
-## Features
+## Возможности
 
-- Utilizes the tablet's full area.
-- All 12 physical buttons are functional.
-- Both stylus buttons are operational.
-- Supports about 700 levels of pressure sensitivity. While the device is marketed with 8192 levels, the hardware only reports 1024, of which roughly 700 are usable without risking damage to the stylus.
+- Используется вся рабочая область планшета.
+- Работают все физические кнопки планшета и обе кнопки пера.
+- Чувствительность к нажиму: железо отдаёт 1024 уровня (рекламируемые 8192 планшет не передаёт), из них безопасно используется около 700.
+- Все события пера отправляются одним кадром: позиция, давление и касание не расходятся, нет рывков.
+- Защита от фантомных касаний: касание засчитывается только после нескольких отчётов подряд выше порога.
+- Гистерезис касания: линия не рвётся на самом лёгком нажиме.
+- Настраиваемая кривая давления.
+- Вход и выход пера из зоны (`BTN_TOOL_PEN`).
+- Кнопки с общим модификатором (например, Ctrl) не отпускают его, пока удерживается другая кнопка.
+- Подбор параметров под ваше перо одной командой (`calibrate`).
 
-## Installation
+## Установка
 
-To build and run the driver, follow these steps:  
-[You will need rust installed](https://wiki.archlinux.org/title/rust)
+Нужны Rust (cargo), `libusb` и `pkg-config`.
+
+Arch / CachyOS:
 
 ```bash
-git clone git@github.com:marvinbelfort/mx002_linux_driver.git
-cd mx002_linux_driver
+sudo pacman -S rust libusb pkgconf
+```
+
+Debian / Ubuntu:
+
+```bash
+sudo apt install cargo libusb-1.0-0-dev pkg-config
+```
+
+Сборка:
+
+```bash
+git clone https://github.com/dan4ikk3/mx002_linux_driver_cachyos.git
+cd mx002_linux_driver_cachyos
 cargo build --release
 ```
 
-The driver will be located in `target/release/mx002`.
+Готовый драйвер: `target/release/mx002`.
 
-## Usage
+## Запуск
 
-To run the driver, you have two options:
+Самый простой способ — запускать от root:
 
-1. **Run as Root:**
+```bash
+sudo ./target/release/mx002                 # режим рисования
+sudo ./target/release/mx002 --mode osu      # режим osu!
+```
+
+Чтобы запускать без `sudo`, дайте пользователю доступ к планшету через udev-правило:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="08f2", ATTRS{idProduct}=="6811", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-mx002.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Переподключите планшет. Правило может отличаться в зависимости от дистрибутива. Если драйвер без `sudo` жалуется на `/dev/uinput`, загрузите модуль (`sudo modprobe uinput`) и добавьте доступ к нему:
+
+```bash
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-uinput.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Остановка: `Ctrl+C`.
+
+### Вспомогательный скрипт
+
+`switch-mode.sh` собирает проект и запускает драйвер с нужными аргументами:
+
+```bash
+./switch-mode.sh draw             # собрать и запустить в режиме рисования
+./switch-mode.sh osu              # собрать и запустить в режиме osu!
+./switch-mode.sh calibrate        # подбор параметров под ваше перо
+./switch-mode.sh dump             # диагностика: сырые отчёты планшета
+./switch-mode.sh build            # только собрать
+./switch-mode.sh draw --max 650   # аргументы передаются драйверу
+```
+
+Скрипт запускает драйвер без `sudo`, поэтому ему нужно udev-правило выше. Либо соберите командой `./switch-mode.sh build` и запускайте бинарник через `sudo` сами.
+
+## Параметры командной строки
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `--mode draw\|osu` | `draw` | Режим работы. |
+| `--base N` | `1740` | Сырое значение давления, когда перо не касается планшета. |
+| `--threshold N` | `150` | Порог касания: насколько давление должно превысить `base`. |
+| `--max N` | `700` | Нажим, при котором выдаётся 100% давления. Выше значения зажимаются. |
+| `--curve F` | `1.0` | Кривая давления. 1.0 — линейно, меньше 1.0 — мягче (проще дойти до сильного нажима), больше — жёстче. |
+| `--debounce N` | `2` | Сколько отчётов подряд давление должно быть выше порога до касания (1–10). 1 — защита от фантомных нажатий выключена. |
+| `--smooth F` | `0` в draw, `0.5` в osu | Сглаживание позиции от 0.0 до 0.9. Быстрые движения проходят без задержки. |
+| `--scale F` | `8.0` | Множитель координат в режиме osu!: чем больше, тем меньше рабочая область. |
+| `--max-x N`, `--max-y N` | `4096` | Размер области сырых координат планшета. |
+| `--size ШxВ` | не задан | Физический размер рабочей области в мм, например `254x158`. Задаёт разрешение осей, чтобы программы могли сохранять пропорции. |
+| `--no-proximity` | выкл. | Не отправлять вход и выход пера из зоны. |
+| `--prox-timeout MS` | `100` | Через сколько мс без отчётов считать, что перо ушло из зоны. |
+| `--calibrate` | | Показать диапазон давления и координат вашего пера и выйти. |
+| `--dump` | | Печатать сырые отчёты планшета (диагностика) и выйти. |
+| `--help` | | Справка. |
+
+## Настройка под своё перо
+
+Значения по умолчанию подходят не каждому перу и планшету.
+
+1. Запустите калибровку:
 
    ```bash
-   sudo ./mx002
+   ./switch-mode.sh calibrate
    ```
 
-2. **Create a udev Rule:**
-
-   For Arch Linux (this may vary by distribution):
+2. Проведите пером по всем краям рабочей области и понажимайте так, как привыкли рисовать (не давите сильнее обычного, выше примерно 700 уровней есть риск повредить перо). Нажмите `Ctrl+C`.
+3. Драйвер выведет рекомендуемые `--base`, `--threshold`, `--max` и размеры области `--max-x`, `--max-y`.
+4. Запускайте с этими значениями:
 
    ```bash
-   echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="08f2", ATTRS{idProduct}=="6811", TAG+="uaccess"' > /etc/udev/rules.d/99-mx002.rules
-   sudo udevadm control --reload-rules
-   sudo udevadm trigger
+   ./switch-mode.sh draw --base 1740 --threshold 120 --max 650 --curve 0.8
    ```
 
-   This allows any user to run the driver without needing sudo.
+## Если что-то работает не так
 
-## Multiple Monitors:
+- **Фантомные нажатия.** Увеличьте `--debounce` (3–4) или `--threshold`. Если нажатия появляются при поднятом пере, пришлите вывод `./switch-mode.sh dump`.
+- **Перо реагирует слишком высоко над планшетом.** Высоту зависания определяет прошивка планшета. В известных нам отчётах нет данных о высоте, поэтому драйвер может определить только «перо вне зоны» по паузе в отчётах (`--prox-timeout`). Чтобы найти в отчётах байт высоты, запустите `./switch-mode.sh dump`: подержите перо над планшетом, медленно поднимайте до максимальной высоты и уберите совсем, затем нажмите `Ctrl+C` и приложите вывод к issue.
+- **Слишком сильный или слабый нажим.** Подберите `--max` (меньше — чувствительнее) и `--curve` (меньше 1.0 — мягче).
+- **В osu! курсор дрожит или, наоборот, «вязнет».** Подберите `--smooth`: больше — меньше дрожания, меньше — отзывчивее. `--smooth 0` отключает сглаживание.
+- **Курсор упирается в край, не доходя до края планшета (или рисует за его пределами).** Проверьте `--max-x` и `--max-y` через `calibrate`.
+- **Перо ведёт себя странно после обновления.** Попробуйте `--no-proximity`.
+- **Ошибка доступа к планшету или `/dev/uinput`.** Запускайте через `sudo` или настройте udev-правила (см. выше).
 
-Show input devices with:
+## Несколько мониторов
+
+### X11
+
+Посмотрите устройства ввода:
+
 ```bash
 xinput
-
-⎡ Virtual core pointer                    	id=2	[master pointer  (3)]
-... 
-⎜   ↳ virtual_tablet Pen (0)                  	id=10	[slave  pointer  (2)]
-⎣ Virtual core keyboard                   	id=3	[master keyboard (2)]
-...
-    ↳ virtual_tablet                          	id=8	[slave  keyboard (3)]
-    ↳ virtual_tablet                          	id=9	[slave  keyboard (3)]
 ```
 
-If you can't see the entry "virtual_tablet Pen", move the pen a bit and run the command again.
-Remember it's id (10 in the example)
+Найдите строку `virtual_tablet Pen` и запомните её `id`. Если её нет, подвигайте пером и повторите команду.
 
-List existing monitors:
-```
-xrandr | rg '\bconnected\b'
+Список мониторов:
 
-HDMI-0 connected primary 2560x1080+0+0 (normal left inverted right x axis y axis) 673mm x 284mm
-DP-2 connected 1680x1050+2560+84 (normal left inverted right x axis y axis) 473mm x 296mm
+```bash
+xrandr | grep ' connected'
 ```
 
-So, to map the pen's movement only to monitor 2, use:
+Привязка пера к одному монитору (пример: id 10, монитор `DP-2`):
 
 ```bash
 xinput map-to-output 10 "DP-2"
 ```
 
+### Wayland
 
+Область вывода задаётся настройками окружения рабочего стола (например, в KDE Plasma — настройки графического планшета).
 
-## TODOs
+## Кнопки
 
-- Enable more direct configuration of emitted key combinations.
-- Implement mapping of the tablet area vs. multiple monitors.
-- Exhaust the SET REPORT HID protocol combinations to determine if any of them enable the advertised pressure of 8192. (but I really suspect that's all there is to it.)
-- Add support for the 10 virtual buttons.
+Кнопки планшета отправляют клавиши. Номера логические, соответствие определяется в `src/virtual_device.rs`:
 
-## References
+| Кнопка | Клавиши |
+|---|---|
+| 0 | Tab |
+| 1 | Space |
+| 2 | Alt |
+| 3 | Ctrl |
+| 4 | Scroll Down |
+| 5 | Scroll Up |
+| 6 | `[` |
+| 7 | Ctrl + Num − |
+| 8 | Ctrl + Num + |
+| 9 | E |
+| 12 | B |
+| 13 | `]` |
 
-- [Tool that enables expanded mode for the tablet, by DigiMend](https://github.com/DIGImend/10moons-tools)
-- [Learning about the possibility of creating user-space drivers](https://github.com/alex-s-v/10moons-driver)
+Кнопки пера: `BTN_STYLUS` и `BTN_STYLUS2`.
 
-This code is a combination of the two above, with some improvements.
+## Разработка
 
+```bash
+cargo build --release
+cargo test
+```
+
+## Планы
+
+- Более простая настройка комбинаций клавиш.
+- Сопоставление рабочей области планшета с несколькими мониторами.
+- Выяснить по HID-протоколу SET REPORT, можно ли получить заявленные 8192 уровня давления (вероятно, нет).
+- Поддержка 10 виртуальных кнопок.
+- Точное определение выхода пера из зоны и высоты зависания по отчётам планшета.
+
+## Источники и благодарности
+
+- [Инструмент для включения расширенного режима планшета, DIGImend](https://github.com/DIGImend/10moons-tools)
+- [Пример драйвера в пространстве пользователя, alex-s-v](https://github.com/alex-s-v/10moons-driver)
+- Оригинальный драйвер [marvinbelfort/mx002_linux_driver](https://github.com/marvinbelfort/mx002_linux_driver), от которого сделан этот форк.
+
+Код основан на двух первых источниках с доработками.
