@@ -6,7 +6,7 @@ A user-space driver for the graphics tablet sold in Brazil as the Multilaser MX0
 
 Two modes:
 
-- **draw** — drawing: full active area, pressure, pen proximity like regular tablets;
+- **draw** — drawing: full active area, pressure, phantom-touch protection;
 - **osu** — osu! gameplay: higher sensitivity and adaptive smoothing that damps jitter without lagging fast movements.
 
 ## Supported devices
@@ -30,7 +30,8 @@ lsusb | grep 08f2:6811
 - All pen events go out in a single frame, so position, pressure and touch never disagree.
 - Phantom-touch protection: a touch needs several consecutive over-threshold reports.
 - Touch hysteresis (strokes do not break at the lightest pressure) and a configurable pressure curve.
-- Pen proximity events (`BTN_TOOL_PEN`).
+- Optional pen proximity events (`BTN_TOOL_PEN`, `--proximity`).
+- Garbage reports from outside the sensing range (impossible pressure values) are not treated as a press.
 - Buttons sharing a modifier (e.g. Ctrl) do not release it while another button still holds it.
 - One-command calibration for your pen (`calibrate`).
 
@@ -101,29 +102,50 @@ The script runs the driver without `sudo`, so it needs the udev rule above (or b
 | `--scale F` | `8.0` | Coordinate multiplier in osu! mode; larger means a smaller active area. |
 | `--max-x N`, `--max-y N` | `4096` | Raw coordinate extents of the tablet. |
 | `--size WxH` | unset | Physical active area in mm, e.g. `254x158`; sets axis resolution so applications can keep the aspect ratio. |
-| `--no-proximity` | off | Do not send pen in/out of range events. |
-| `--prox-timeout MS` | `100` | Milliseconds without reports before the pen is considered out of range. |
-| `--calibrate` | | Show your pen's pressure and coordinate ranges and exit. |
+| `--valid-max N` | `1100` | If `base − raw` exceeds this, the report is treated as garbage (pen out of range), not a press. Must be larger than `--max`. |
+| `--proximity` | off | Send pen in/out of range events (detected by a pause in reports; enable only if needed). |
+| `--prox-timeout MS` | `100` | With `--proximity` only: milliseconds without reports before the pen counts as out of range. |
+| `--verbose`, `-v` | | Print touch start/end (with raw values) and discarded reports. Diagnostics. |
+| `--calibrate` | | Phase-based calibration (out of range, hovering, drawing): tunes the options and exits. |
 | `--dump` | | Print raw tablet reports (diagnostics) and exit. |
 
 ## Tuning for your pen
 
-1. Run `./switch-mode.sh calibrate`.
-2. Sweep the pen over all edges of the active area and press as you normally draw (do not press harder than usual; above about 700 levels the pen may be damaged). Press `Ctrl+C`.
-3. The driver prints recommended `--base`, `--threshold`, `--max` and `--max-x`/`--max-y`. Use them, e.g.:
+Defaults do not fit every pen and tablet. Calibrate (about one minute):
 
-   ```bash
-   ./switch-mode.sh draw --base 1740 --threshold 120 --max 650 --curve 0.8
-   ```
+1. Run `./switch-mode.sh calibrate`.
+2. Follow the three phases (3 seconds to get ready before each):
+   - **Phase 1/3, 4 s:** remove the pen from the tablet completely and do not touch it.
+   - **Phase 2/3, 6 s:** hold the pen 1–3 cm above the tablet and move it slowly **without touching**.
+   - **Phase 3/3, 12 s:** draw as usual: strokes over the whole area, light and hard presses, reach the edges. Do not press harder than usual (above about 700 levels the pen may be damaged).
+3. The driver prints a ready command, e.g. `mx002 --base 1740 --threshold 120 --max 650 --valid-max 900 --max-x 4096 --max-y 4096`. Run the driver with these options.
+4. If phase 2 shows that hovering gives a press almost as strong as drawing, the driver warns you: the threshold has to be high.
+
+## Pen clicks when lifted, "sticks" or presses by itself
+
+The tablet keeps sending reports while the pen is within sensor range (several centimetres), and a touch is detected only from the raw pressure value. Noise above the tablet or garbage values outside the range can exceed the threshold, so the cursor stops and applications see a click. In order:
+
+1. **Update and rebuild:** `git pull && cargo build --release`.
+2. **See what happens:** `sudo ./target/release/mx002 --mode osu --verbose`. Each touch prints a line like `touch STARTED raw=1500 delta=240 x=... y=...`. Move the pen away: if a touch starts while the pen is lifted, note its `delta` (the "press" caused by interference). A line saying pressure is out of the valid range means a garbage report was discarded (normal).
+3. **Calibrate** (see above), the most reliable way.
+4. **Or tune manually:**
+   - false touch with a small `delta` (e.g. 200–400): raise `--threshold` above it with a 20–30 margin;
+   - false touch with a huge `delta` (above any real press, e.g. 1700 at `raw=0`): lower `--valid-max` below it but above `--max`;
+   - rare single spikes: raise `--debounce` to 3–4 (touch starts 1–2 reports later).
+5. **Do not enable `--proximity` unless needed.** It detects "out of range" by a pause in reports; if the tablet only reports on change, the pen "leaves" in the middle of a still press and the click is lost. It is off by default.
+6. **osu!:** to rule out smoothing, try `--smooth 0`; if it helps, tune 0.2–0.3.
+7. **Still broken?** Run `./switch-mode.sh dump`, hold the pen over the tablet, lift it slowly to the maximum height and remove it, then `Ctrl+C`. Attach the dump and the `--verbose` output to an issue.
+
+**Cursor moves with the pen lifted 4–5 cm:** hover range is decided by the tablet firmware, and the reports known to us contain no height data, so the driver can only avoid counting a click (above) but cannot stop the cursor at a height. If the dump reveals a byte that changes while lifting the pen, such a limit can be added.
 
 ## Troubleshooting
 
-- **Phantom touches:** raise `--debounce` (3–4) or `--threshold`. If they occur while the pen is lifted, attach the output of `./switch-mode.sh dump` to an issue.
-- **Pen reacts too high above the tablet:** hover range is decided by the tablet firmware, and the reports known to us contain no height data, so the driver can only detect "out of range" by a pause in reports (`--prox-timeout`). To look for a height byte, run `./switch-mode.sh dump`, hold the pen over the tablet, lift it slowly to its maximum height, remove it, then press `Ctrl+C` and attach the output to an issue.
+- **Clicks when the pen is lifted, sticking, phantom touches:** see the section above.
+- **Cursor moves with the pen lifted 4–5 cm:** see the section above; hover range is decided by the tablet firmware.
 - **Pressure too strong or weak:** tune `--max` (lower is more sensitive) and `--curve` (below 1.0 is softer).
 - **osu! cursor jitters or feels sluggish:** tune `--smooth` (higher damps jitter, lower is snappier; `0` disables).
 - **Cursor stops short of or runs past the tablet edge:** check `--max-x`/`--max-y` with `calibrate`.
-- **Odd pen behaviour:** try `--no-proximity`.
+- **Access errors for the tablet or `/dev/uinput`:** run with `sudo` or set up the udev rules (see above).
 
 ## Multiple monitors
 

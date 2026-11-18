@@ -113,6 +113,7 @@ pub struct DeviceDispatcher {
     was_touching: bool,
     in_proximity: bool,
     last_report: Instant,
+    invalid_pressure: bool,
     last_abs: Option<(i32, i32, i32)>,
 }
 
@@ -181,6 +182,7 @@ impl DeviceDispatcher {
             was_touching: false,
             in_proximity: false,
             last_report: Instant::now(),
+            invalid_pressure: false,
             last_abs: None,
         }
     }
@@ -328,6 +330,17 @@ impl DeviceDispatcher {
             self.config
                 .pressure(self.touch.touching(), raw_pressure, Self::PRESSURE_MAX);
         let touching = self.touch.update(over);
+        if self.config.verbose {
+            let delta = self.config.base - raw_pressure;
+            let invalid = delta > self.config.valid_max_delta;
+            if invalid != self.invalid_pressure {
+                eprintln!(
+                    "[verbose] {} raw={raw_pressure} delta={delta}",
+                    if invalid { "давление вне допустимого диапазона, отчёт игнорируется" } else { "диапазон снова допустим" }
+                );
+            }
+            self.invalid_pressure = invalid;
+        }
         (touching, if touching { value } else { 0 })
     }
 
@@ -386,6 +399,14 @@ impl DeviceDispatcher {
             let state = if is_touching { Self::PRESSED } else { Self::RELEASED };
             events.push(InputEvent::new(EventType::KEY, Key::BTN_TOUCH.code(), state));
             self.was_touching = is_touching;
+            if self.config.verbose {
+                eprintln!(
+                    "[verbose] касание {} raw={} delta={} x={x} y={y}",
+                    if is_touching { "НАЧАЛОСЬ" } else { "закончилось" },
+                    raw_data.pressure(),
+                    self.config.base - raw_data.pressure()
+                );
+            }
         }
 
         // Всё в одном кадре: позиция, давление и касание приходят атомарно.
@@ -429,6 +450,8 @@ mod tests {
         assert!(press(&c, false, 1740 - 151).0); // коснулись
         assert_eq!(press(&c, false, 1740 - 700), (true, 8191)); // 100% на --max
         assert_eq!(press(&c, false, 1740 - 1000), (true, 8191)); // выше — зажато
+        assert_eq!(press(&c, false, 0), (false, 0)); // мусор вне зоны (raw=0) — не касание
+        assert_eq!(press(&c, true, 1740 - 1101), (false, 0)); // за допустимым диапазоном
         // гистерезис: уже касаемся -> держим до release_threshold; из воздуха — нет
         assert!(press(&c, true, 1740 - 120).0);
         assert!(!press(&c, false, 1740 - 120).0);
