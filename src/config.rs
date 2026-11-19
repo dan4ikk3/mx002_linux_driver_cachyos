@@ -30,12 +30,17 @@ pub struct Config {
     /// Сколько отчётов подряд давление должно быть выше порога, чтобы началось касание
     /// (защита от фантомных нажатий). 1 — без защиты.
     pub debounce: u32,
+    /// Отбрасывать давление, если (base - raw) больше этого значения: так «мусорные» отчёты
+    /// вне зоны (например, raw = 0) не превращаются в сильное нажатие.
+    pub valid_max_delta: i32,
     pub proximity: bool,
     /// Через сколько мс без отчётов считаем, что перо вышло из зоны.
     pub prox_timeout_ms: u64,
     pub calibrate: bool,
     /// Диагностика: печатать сырые отчёты планшета (для поиска байта «перо вне зоны»).
     pub dump: bool,
+    /// Печатать в stderr переходы касания и отброшенные отчёты.
+    pub verbose: bool,
 }
 
 impl Default for Config {
@@ -53,10 +58,12 @@ impl Default for Config {
             max_y: 4096,
             size_mm: None,
             debounce: 2,
-            proximity: true,
+            valid_max_delta: 1100,
+            proximity: false,
             prox_timeout_ms: 100,
             calibrate: false,
             dump: false,
+            verbose: false,
         }
     }
 }
@@ -72,6 +79,9 @@ impl Config {
     /// `release_threshold`, поэтому линия не «рвётся» на самом лёгком нажиме.
     pub fn pressure(&self, was_touching: bool, raw: i32, pressure_max: i32) -> (bool, i32) {
         let delta = self.base - raw;
+        if delta > self.valid_max_delta {
+            return (false, 0); // невозможное для железа значение — отчёт вне зоны, не касание
+        }
         let limit = if was_touching { self.release_threshold() } else { self.threshold };
         if delta <= limit {
             return (false, 0);
@@ -121,13 +131,19 @@ impl Config {
                     c.size_mm = Some((parse(w)?, parse(h)?));
                 }
                 "--debounce" => c.debounce = parse(&value("--debounce")?)?,
+                "--valid-max" => c.valid_max_delta = parse(&value("--valid-max")?)?,
+                "--proximity" => c.proximity = true,
                 "--no-proximity" => c.proximity = false,
+                "--verbose" | "-v" => c.verbose = true,
                 "--prox-timeout" => c.prox_timeout_ms = parse(&value("--prox-timeout")?)?,
                 "--calibrate" => c.calibrate = true,
                 "--dump" => c.dump = true,
                 "--help" | "-h" => return Err(Self::usage()),
                 other => return Err(format!("неизвестный аргумент: {other}\n{}", Self::usage())),
             }
+        }
+        if c.valid_max_delta <= c.max_delta {
+            return Err("--valid-max должен быть больше --max".into());
         }
         if c.max_delta <= c.threshold {
             return Err("--max должен быть больше --threshold".into());
@@ -155,7 +171,8 @@ impl Config {
     pub fn usage() -> String {
         "Использование: mx002 [--mode draw|osu] [--base N] [--threshold N] [--max N] \
          [--curve F] [--scale F] [--smooth F]\n\
-         \x20        [--max-x N] [--max-y N] [--size WxH] [--debounce N] [--no-proximity] [--prox-timeout MS] [--calibrate] [--dump]\n\
+         \x20        [--max-x N] [--max-y N] [--size WxH] [--debounce N] [--valid-max N]\n\
+         \x20        [--proximity] [--prox-timeout MS] [--verbose] [--calibrate] [--dump]\n\
          \n  --mode       draw (по умолчанию) или osu\
          \n  --base       сырое давление в покое (по умолчанию 1740)\
          \n  --threshold  порог касания (150)\
@@ -166,8 +183,10 @@ impl Config {
          \n  --max-x/-y   размер области сырых координат (4096) — подбирается --calibrate\
          \n  --size WxH   физический размер рабочей области, мм (для пропорций и разрешения осей)\
          \n  --debounce   отчётов подряд выше порога до касания, защита от фантомных нажатий (2)\
-         \n  --no-proximity  не отправлять вход/выход пера из зоны\
-         \n  --prox-timeout  мс без отчётов до «пера нет в зоне» (100)\
+         \n  --valid-max  (base - raw) выше этого — отчёт вне зоны, не нажим (1100)\
+         \n  --proximity  отправлять вход/выход пера из зоны (по умолчанию выключено)\
+         \n  --prox-timeout  мс без отчётов до «пера нет в зоне» (100), только с --proximity\
+         \n  --verbose    печатать переходы касания и отброшенные отчёты (диагностика)\
          \n  --calibrate  показать диапазон давления и координат вашего пера и выйти\
          \n  --dump       печатать сырые отчёты планшета (диагностика) и выйти"
             .into()
@@ -191,7 +210,7 @@ mod tests {
         let c = parse_args(&[]).unwrap();
         assert_eq!(c.mode, Mode::Draw);
         assert_eq!(c.smooth, 0.0);
-        assert!(c.proximity);
+        assert!(!c.proximity);
     }
 
     #[test]
@@ -216,6 +235,7 @@ mod tests {
         assert!(parse_args(&["--smooth", "1.5"]).is_err());
         assert!(parse_args(&["--curve", "0"]).is_err());
         assert!(parse_args(&["--max-x", "0"]).is_err());
+        assert!(parse_args(&["--valid-max", "700"]).is_err()); // не больше --max
         assert!(parse_args(&["--bogus"]).is_err());
     }
 
@@ -229,8 +249,8 @@ mod tests {
 
     #[test]
     fn proximity_flags() {
-        let c = parse_args(&["--no-proximity", "--prox-timeout", "250"]).unwrap();
-        assert!(!c.proximity);
+        let c = parse_args(&["--proximity", "--prox-timeout", "250"]).unwrap();
+        assert!(c.proximity);
         assert_eq!(c.prox_timeout_ms, 250);
     }
 }
